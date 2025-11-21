@@ -1,0 +1,1076 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>FrontWars Clone — Multiplayer (Firebase)</title>
+<style>
+  :root{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;}
+  body{margin:0;display:flex;height:100vh;background:#061021;color:#eaf6ff}
+  #left{flex:1;display:flex;align-items:center;justify-content:center}
+  #canvasWrap{width:960px;height:640px;background:#08101a;border-radius:8px;box-shadow:0 6px 30px rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+  canvas{background:linear-gradient(#07101a,#061019);border-radius:6px}
+  #ui{width:360px;padding:20px;background:#061926;border-left:1px solid rgba(255,255,255,0.03);overflow:auto}
+  h1{margin:0 0 8px;font-size:20px}
+  .panel{background:rgba(255,255,255,0.02);padding:12px;border-radius:8px;margin-bottom:12px}
+  input, button, select{padding:8px;border-radius:8px;border:0}
+  button{cursor:pointer}
+  .log{height:140px;overflow:auto;background:rgba(255,255,255,0.02);padding:8px;border-radius:6px;font-size:13px}
+  .playersList div{margin-bottom:6px}
+  .btnRow button{margin-right:8px}
+  small{color:#9fb6d6}
+  footer{font-size:12px;color:#7da0c0;margin-top:8px}
+</style>
+</head>
+<body>
+
+<div id="left">
+  <div id="canvasWrap">
+    <canvas id="gameCanvas" width="960" height="640"></canvas>
+  </div>
+</div>
+
+<div id="ui">
+  <h1>FrontWars — Lobby & Multiplayer</h1>
+
+  <div class="panel">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <input id="displayName" placeholder="Dein Name (optional)" style="flex:1" />
+      <button id="btnAnon">Login</button>
+    </div>
+    <small>Login per Firebase (anonym) — sofort spielbereit.</small>
+  </div>
+
+  <div class="panel">
+    <div><strong>Party</strong></div>
+    <div style="margin-top:8px;display:flex;gap:8px;">
+      <input id="partyInput" placeholder="Party-Code" />
+      <button id="createParty">Create</button>
+      <button id="joinParty">Join</button>
+    </div>
+    <div style="margin-top:8px" class="playersList" id="playersList"></div>
+    <div style="margin-top:8px" class="btnRow">
+      <button id="startMatch">Start Match</button>
+      <button id="leaveParty">Leave</button>
+    </div>
+    <div style="margin-top:8px"><small id="partyStatus">Nicht verbunden</small></div>
+  </div>
+
+  <div class="panel">
+    <div><strong>In-Game</strong></div>
+    <div style="margin-top:8px">
+      <button id="buildCity">Stadt bauen (50)</button>
+      <button id="recruitUnit">Rekrutieren (10)</button>
+      <button id="endTurn">End Turn</button>
+    </div>
+    <div style="margin-top:8px" id="tileInfo">Feld: -</div>
+  </div>
+
+  <div class="panel">
+    <div><strong>Log</strong></div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <footer>Hosted via GitHub Pages + Firebase | Einfaches Turn-Base Sync Modell</footer>
+</div>
+
+<!-- ========== JS (module) ========== -->
+<script type="module">
+// ------------------ Firebase v12 imports ------------------
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.6.0/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.6.0/firebase-auth.js";
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  getDoc,
+  updateDoc,
+  onSnapshot,
+  arrayUnion,
+  arrayRemove,
+  serverTimestamp,
+  runTransaction
+} from "https://www.gstatic.com/firebasejs/12.6.0/firebase-firestore.js";
+
+// ------------------ Deine Firebase Config (ersetzen wenn nötig) ------------------
+const firebaseConfig = {
+  apiKey: "AIzaSyAwIyqQou1GKlL9cztwjCHMYm0g-FVQo5U",
+  authDomain: "frontwars-6cd56.firebaseapp.com",
+  projectId: "frontwars-6cd56",
+  storageBucket: "frontwars-6cd56.firebasestorage.app",
+  messagingSenderId: "426115388998",
+  appId: "1:426115388998:web:4b94ddc0a3939dc7e59c47",
+  measurementId: "G-BL1BWCQZFS"
+};
+
+// init
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// ------------------ UI refs ------------------
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const logEl = document.getElementById('log');
+const partyStatusEl = document.getElementById('partyStatus');
+const playersListEl = document.getElementById('playersList');
+const tileInfoEl = document.getElementById('tileInfo');
+
+let uid = null;
+let displayName = '';
+let currentPartyId = null;
+let currentPartyUnsub = null;
+let currentMatchId = null;
+let currentMatchUnsub = null;
+let myPlayerIndex = null; // index inside match.players
+
+// Map config (same for all clients)
+const COLS = 12;
+const ROWS = 8;
+const TILE = Math.floor(Math.min(canvas.width/COLS, canvas.height/ROWS));
+const OFFSET_X = Math.floor((canvas.width - COLS*TILE)/2);
+const OFFSET_Y = Math.floor((canvas.height - ROWS*TILE)/2);
+
+// local view
+let viewMatch = null; // mirror of match doc
+let selected = null;
+
+// ------------------ Utils ------------------
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  logEl.innerHTML = `<div>[${t}] ${msg}</div>` + logEl.innerHTML;
+}
+
+function genCode(len=6){ return Math.random().toString(36).substring(2, 2+len).toUpperCase(); }
+function tileKey(x,y){ return `${x},${y}`; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+// ------------------ AUTH ------------------
+document.getElementById('btnAnon').onclick = async ()=>{
+  displayName = document.getElementById('displayName').value.trim() || null;
+  try{
+    await signInAnonymously(auth);
+  }catch(e){ log('Auth error: '+e.message); }
+};
+
+onAuthStateChanged(auth, user=>{
+  if(user){ uid = user.uid; log('Angemeldet: '+uid.slice(0,6)); }
+  else { uid = null; log('Abgemeldet'); }
+});
+
+// ------------------ PARTY ------------------
+document.getElementById('createParty').onclick = async ()=>{
+  if(!uid){ log('Login zuerst'); return; }
+  const id = genCode(6);
+  const ref = doc(db, 'parties', id);
+  await setDoc(ref, {
+    hostUid: uid,
+    createdAt: serverTimestamp(),
+    isPrivate: true,
+    players: [{ uid, name: displayName || ('Player-'+uid.slice(0,6)) }],
+    status: 'waiting'
+  });
+  joinPartyLocal(id);
+};
+
+document.getElementById('joinParty').onclick = async ()=>{
+  if(!uid){ log('Login zuerst'); return; }
+  const id = document.getElementById('partyInput').value.trim().toUpperCase();
+  if(!id){ log('Gib Party-Code!'); return; }
+  const ref = doc(db, 'parties', id);
+  const snap = await getDoc(ref);
+  if(!snap.exists()){ log('Party nicht gefunden'); return; }
+  await updateDoc(ref, {
+    players: arrayUnion({ uid, name: displayName || ('Player-'+uid.slice(0,6)) })
+  });
+  joinPartyLocal(id);
+};
+
+document.getElementById('leaveParty').onclick = async ()=>{
+  if(!currentPartyId){ log('Nicht in Party'); return; }
+  const ref = doc(db, 'parties', currentPartyId);
+  await updateDoc(ref, {
+    players: arrayRemove({ uid, name: displayName || ('Player-'+uid.slice(0,6)) })
+  });
+  if(currentPartyUnsub) currentPartyUnsub();
+  currentPartyId = null;
+  partyStatusEl.textContent = 'Nicht verbunden';
+  playersListEl.innerHTML = '';
+  log('Party verlassen');
+};
+
+function joinPartyLocal(id){
+  if(currentPartyUnsub) currentPartyUnsub();
+  currentPartyId = id;
+  partyStatusEl.textContent = 'In Party: ' + id;
+  log('Joined ' + id);
+  const ref = doc(db, 'parties', id);
+  currentPartyUnsub = onSnapshot(ref, snap=>{
+    if(!snap.exists()){ partyStatusEl.textContent = 'Party gelöscht'; return; }
+    const data = snap.data();
+    renderParty(data);
+    // Wenn Host gestartet hat, load match
+    if(data.status === 'starting' && data.matchId){
+      loadMatch(data.matchId);
+    }
+  });
+}
+
+function renderParty(data){
+  playersListEl.innerHTML = '';
+  (data.players||[]).forEach((p,i)=>{
+    const d = document.createElement('div');
+    d.textContent = `${i+1}. ${p.name || p.uid.slice(0,6)} ${p.uid === data.hostUid ? '(Host)' : ''}`;
+    playersListEl.appendChild(d);
+  });
+  // show start button enabled only for host
+  const startBtn = document.getElementById('startMatch');
+  startBtn.disabled = (data.hostUid !== uid);
+}
+
+// ------------------ START MATCH (host) ------------------
+document.getElementById('startMatch').onclick = async ()=>{
+  if(!currentPartyId){ log('Kein Party'); return; }
+  const partyRef = doc(db, 'parties', currentPartyId);
+  const partySnap = await getDoc(partyRef);
+  if(!partySnap.exists()) return log('Party weg');
+  const pData = partySnap.data();
+  if(pData.hostUid !== uid) return log('Nur Host kann starten');
+
+  // Erzeuge Match-Dokument mit initialer Map
+  const matchId = genCode(7);
+  // build map: array of tile objects keyed by "x,y"
+  const tiles = {};
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      tiles[tileKey(x,y)] = { owner: null, units: 0, city: false, res: (Math.random()<0.08?3:(Math.random()<0.2?2:1)) };
+    }
+  }
+  // spawn starting cities for players (spread)
+  const starts = [
+    [1,1],
+    [COLS-2,ROWS-2],
+    [1,ROWS-2],
+    [COLS-2,1]
+  ];
+  (pData.players||[]).forEach((pl,i)=>{
+    const pos = starts[i % starts.length];
+    const k = tileKey(pos[0], pos[1]);
+    tiles[k].owner = pl.uid;
+    tiles[k].units = 5;
+    tiles[k].city = true;
+  });
+
+  const matchRef = doc(db, 'matches', matchId);
+  await setDoc(matchRef, {
+    createdAt: serverTimestamp(),
+    players: pData.players, // array of {uid,name}
+    tiles,
+    turnIndex: 0, // index into players array
+    round: 1,
+    status: 'running'
+  });
+
+  // update party to point to match
+  await updateDoc(partyRef, { status: 'starting', matchId });
+  log('Match gestartet: ' + matchId);
+};
+
+// ------------------ LOAD MATCH (everyone) ------------------
+async function loadMatch(matchId){
+  if(currentMatchUnsub) currentMatchUnsub();
+  currentMatchId = matchId;
+  const ref = doc(db, 'matches', matchId);
+  currentMatchUnsub = onSnapshot(ref, snap=>{
+    if(!snap.exists()){ log('Match deleted'); return; }
+    viewMatch = snap.data();
+    renderMatch();
+  });
+  log('Match geladen: '+matchId);
+}
+
+// ------------------ RENDER MAP ------------------
+function renderMatch(){
+  // draw grid from viewMatch.tiles
+  draw();
+  // find my player index
+  if(!viewMatch) return;
+  myPlayerIndex = (viewMatch.players || []).findIndex(p => p.uid === uid);
+  // update UI tileInfo when selected
+  updateTileInfo();
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // BG
+  ctx.fillStyle = '#081221';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      const px = OFFSET_X + x*TILE;
+      const py = OFFSET_Y + y*TILE;
+      // tile background
+      ctx.fillStyle = '#0e1a26';
+      ctx.fillRect(px+1,py+1,TILE-2,TILE-2);
+      // owner tint
+      const t = viewMatch?.tiles?.[tileKey(x,y)];
+      if(t && t.owner){
+        // color by hashing uid -> simple color
+        ctx.fillStyle = uidColor(t.owner);
+        ctx.globalAlpha = 0.18;
+        ctx.fillRect(px+1,py+1,TILE-2,TILE-2);
+        ctx.globalAlpha = 1;
+      }
+      // grid
+      ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+      ctx.strokeRect(px+0.5,py+0.5,TILE-1,TILE-1);
+      // city
+      if(t && t.city){
+        ctx.fillStyle = '#ffd66b';
+        roundRect(ctx, px + TILE*0.22, py + TILE*0.22, TILE*0.56, TILE*0.56, 6, true, false);
+      }
+      // units
+      if(t && t.units>0){
+        ctx.fillStyle = '#e6eef8';
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText(t.units, px + TILE - 22, py + TILE - 10);
+        if(t.owner){
+          // owner dot
+          ctx.fillStyle = uidColor(t.owner);
+          ctx.beginPath(); ctx.arc(px+12,py+TILE-12,6,0,Math.PI*2); ctx.fill();
+        }
+      }
+      // selection highlight
+      if(selected && selected.x===x && selected.y===y){
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(px+3,py+3,TILE-6,TILE-6);
+        ctx.lineWidth = 1;
+      }
+    }
+  }
+}
+
+// helper: map uid -> color
+function uidColor(uidStr){
+  const s = uidStr || 'anon';
+  let h = 0;
+  for(let i=0;i<s.length;i++) h = (h<<5) - h + s.charCodeAt(i);
+  const r = (h>>16)&255, g=(h>>8)&255, b=h&255;
+  return `rgba(${Math.abs(r)%200+30},${Math.abs(g)%200+30},${Math.abs(b)%200+30},1)`;
+}
+
+function roundRect(ctx,x,y,w,h,r,fill,stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+  if(fill) ctx.fill();
+  if(stroke) ctx.stroke();
+}
+
+// canvas click handling
+canvas.addEventListener('click', async (ev)=>{
+  if(!viewMatch) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  const my = ev.clientY - rect.top;
+  const gx = Math.floor((mx - OFFSET_X)/TILE);
+  const gy = Math.floor((my - OFFSET_Y)/TILE);
+  if(gx < 0 || gy < 0 || gx >= COLS || gy >= ROWS) return;
+  const t = viewMatch.tiles[tileKey(gx,gy)];
+  // selection toggle
+  if(!selected){ selected = {x:gx,y:gy}; renderMatch(); return; }
+  if(selected.x===gx && selected.y===gy){ selected = null; renderMatch(); return; }
+  // if selected tile belongs to me and clicked a neighbor -> move
+  const selTile = viewMatch.tiles[tileKey(selected.x, selected.y)];
+  if(selTile && selTile.owner === uid && isNeighbor(selected, {x:gx,y:gy})){
+    // move half units (min 1)
+    const moveCount = Math.max(1, Math.floor(selTile.units / 2));
+    if(moveCount <= 0) { log('Keine Einheiten zum bewegen'); selected = null; renderMatch(); return; }
+    // execute move via transaction to avoid races
+    await performMove(selected.x, selected.y, gx, gy, moveCount);
+    selected = null;
+    return;
+  }
+  // else select new
+  selected = {x:gx,y:gy}; renderMatch();
+});
+
+function isNeighbor(a,b){
+  const dx = Math.abs(a.x-b.x), dy = Math.abs(a.y-b.y);
+  return dx+dy === 1;
+}
+
+// ------------------ ACTIONS (move, build, recruit, endTurn) ------------------
+async function performMove(x1,y1,x2,y2,count){
+  if(!currentMatchId) return log('Kein Match');
+  const matchRef = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const snap = await tx.get(matchRef);
+      if(!snap.exists()) throw 'Match weg';
+      const m = snap.data();
+      // ensure it's your turn
+      const turnIdx = m.turnIndex || 0;
+      if(!m.players || !m.players[turnIdx] || m.players[turnIdx].uid !== uid){
+        throw 'Nicht dein Zug';
+      }
+      const keyFrom = tileKey(x1,y1);
+      const keyTo = tileKey(x2,y2);
+      const from = m.tiles[keyFrom];
+      const to = m.tiles[keyTo];
+      if(!from || from.owner !== uid) throw 'Quelle gehört nicht dir';
+      if(from.units < count) throw 'Nicht genug Einheiten';
+      // subtract
+      from.units -= count;
+      // combat if owner differs
+      if(to.owner && to.owner !== uid){
+        const attack = count + Math.floor(Math.random()*3);
+        const defend = to.units + (to.city?2:0) + Math.floor(Math.random()*3);
+        if(attack > defend){
+          to.owner = uid;
+          to.units = Math.max(0, attack - Math.floor(defend/2));
+        } else {
+          to.units = Math.max(0, defend - Math.floor(attack/2));
+        }
+      } else {
+        // peaceful move
+        to.owner = uid;
+        to.units = (to.units || 0) + count;
+      }
+      // write back
+      m.tiles[keyFrom] = from;
+      m.tiles[keyTo] = to;
+      tx.update(matchRef, { tiles: m.tiles });
+    });
+    log(`Move ${x1},${y1} -> ${x2},${y2} : ${count}`);
+  }catch(e){
+    log('Move failed: ' + e);
+  }
+}
+
+// build city
+document.getElementById('buildCity').onclick = async ()=>{
+  if(!selected) return log('Select ein Feld');
+  if(!currentMatchId) return log('No match');
+  const key = tileKey(selected.x, selected.y);
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match weg';
+      const m = s.data();
+      const tile = m.tiles[key];
+      if(!tile) throw 'Tile fehlt';
+      // only owner can build
+      if(tile.owner !== uid) throw 'Nicht dein Feld';
+      if(tile.city) throw 'Schon Stadt';
+      // cost - for simplicity we don't track money on match; just allow limited builds
+      tile.city = true;
+      m.tiles[key] = tile;
+      tx.update(ref, { tiles: m.tiles });
+    });
+    log('Stadt gebaut');
+  }catch(e){ log('Build failed: '+e); }
+};
+
+// recruit unit (adds 1 unit to selected, owner only)
+document.getElementById('recruitUnit').onclick = async ()=>{
+  if(!selected) return log('Select ein Feld');
+  if(!currentMatchId) return log('No match');
+  const key = tileKey(selected.x, selected.y);
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match gone';
+      const m = s.data();
+      const tile = m.tiles[key];
+      if(!tile) throw 'Tile missing';
+      if(tile.owner !== uid) throw 'Nicht dein Feld';
+      tile.units = (tile.units || 0) + 1;
+      m.tiles[key] = tile;
+      tx.update(ref, { tiles: m.tiles });
+    });
+    log('1 Einheit rekrutiert');
+  }catch(e){ log('Recruit failed: ' + e); }
+};
+
+// end turn
+document.getElementById('endTurn').onclick = async ()=>{
+  if(!currentMatchId) return log('No match');
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match gone';
+      const m = s.data();
+      const turnIdx = m.turnIndex || 0;
+      if(!m.players || m.players[turnIdx].uid !== uid) throw 'Nicht dein Zug';
+      const next = (turnIdx + 1) % (m.players.length || 1);
+      tx.update(ref, { turnIndex: next, round: (m.round||1) + (next===0?1:0) });
+    });
+    log('Turn ended');
+  }catch(e){ log('End turn failed: ' + e); }
+};
+
+// update tile info UI
+function updateTileInfo(){
+  if(!selected || !viewMatch) { tileInfoEl.textContent = 'Feld: -'; return; }
+  const t = viewMatch.tiles[tileKey(selected.x, selected.y)];
+  const ownerName = (viewMatch.players || []).find(p=>p.uid === t?.owner)?.name || 'Niemand';
+  tileInfoEl.innerHTML = `Feld (${selected.x},${selected.y}) — Besitzer: ${ownerName} — Stadt: ${t?.city?'Ja':'Nein'} — Einheiten: ${t?.units||0} — Ressource: ${t?.res||1}`;
+}
+
+// update UI on every snapshot change
+setInterval(()=>{ renderMatch(); updateTileInfo(); }, 800);
+
+// initial draw loop
+function anim(){
+  if(viewMatch) draw();
+  requestAnimationFrame(anim);
+}
+anim();
+
+</script>
+</body>
+</html>
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>FrontWars Clone — Multiplayer (Firebase)</title>
+<style>
+  :root{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;}
+  body{margin:0;display:flex;height:100vh;background:#061021;color:#eaf6ff}
+  #left{flex:1;display:flex;align-items:center;justify-content:center}
+  #canvasWrap{width:960px;height:640px;background:#08101a;border-radius:8px;box-shadow:0 6px 30px rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+  canvas{background:linear-gradient(#07101a,#061019);border-radius:6px}
+  #ui{width:360px;padding:20px;background:#061926;border-left:1px solid rgba(255,255,255,0.03);overflow:auto}
+  h1{margin:0 0 8px;font-size:20px}
+  .panel{background:rgba(255,255,255,0.02);padding:12px;border-radius:8px;margin-bottom:12px}
+  input, button, select{padding:8px;border-radius:8px;border:0}
+  button{cursor:pointer}
+  .log{height:140px;overflow:auto;background:rgba(255,255,255,0.02);padding:8px;border-radius:6px;font-size:13px}
+  .playersList div{margin-bottom:6px}
+  .btnRow button{margin-right:8px}
+  small{color:#9fb6d6}
+  footer{font-size:12px;color:#7da0c0;margin-top:8px}
+</style>
+</head>
+<body>
+
+<div id="left">
+  <div id="canvasWrap">
+    <canvas id="gameCanvas" width="960" height="640"></canvas>
+  </div>
+</div>
+
+<div id="ui">
+  <h1>FrontWars — Lobby & Multiplayer</h1>
+
+  <div class="panel">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <input id="displayName" placeholder="Dein Name (optional)" style="flex:1" />
+      <button id="btnAnon">Login</button>
+    </div>
+    <small>Login per Firebase (anonym) — sofort spielbereit.</small>
+  </div>
+
+  <div class="panel">
+    <div><strong>Party</strong></div>
+    <div style="margin-top:8px;display:flex;gap:8px;">
+      <input id="partyInput" placeholder="Party-Code" />
+      <button id="createParty">Create</button>
+      <button id="joinParty">Join</button>
+    </div>
+    <div style="margin-top:8px" class="playersList" id="playersList"></div>
+    <div style="margin-top:8px" class="btnRow">
+      <button id="startMatch">Start Match</button>
+      <button id="leaveParty">Leave</button>
+    </div>
+    <div style="margin-top:8px"><small id="partyStatus">Nicht verbunden</small></div>
+  </div>
+
+  <div class="panel">
+    <div><strong>In-Game</strong></div>
+    <div style="margin-top:8px">
+      <button id="buildCity">Stadt bauen (50)</button>
+      <button id="recruitUnit">Rekrutieren (10)</button>
+      <button id="endTurn">End Turn</button>
+    </div>
+    <div style="margin-top:8px" id="tileInfo">Feld: -</div>
+  </div>
+
+  <div class="panel">
+    <div><strong>Log</strong></div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <footer>Hosted via GitHub Pages + Firebase | Einfaches Turn-Base Sync Modell</footer>
+</div>
+
+<!-- ========== JS (module) ========== -->
+<script type="module">
+// ------------------ Firebase v12 imports ------------------
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.6.0/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.6.0/firebase-auth.js";
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  getDoc,
+  updateDoc,
+  onSnapshot,
+  arrayUnion,
+  arrayRemove,
+  serverTimestamp,
+  runTransaction
+} from "https://www.gstatic.com/firebasejs/12.6.0/firebase-firestore.js";
+
+// ------------------ Deine Firebase Config (ersetzen wenn nötig) ------------------
+const firebaseConfig = {
+  apiKey: "AIzaSyAwIyqQou1GKlL9cztwjCHMYm0g-FVQo5U",
+  authDomain: "frontwars-6cd56.firebaseapp.com",
+  projectId: "frontwars-6cd56",
+  storageBucket: "frontwars-6cd56.firebasestorage.app",
+  messagingSenderId: "426115388998",
+  appId: "1:426115388998:web:4b94ddc0a3939dc7e59c47",
+  measurementId: "G-BL1BWCQZFS"
+};
+
+// init
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// ------------------ UI refs ------------------
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const logEl = document.getElementById('log');
+const partyStatusEl = document.getElementById('partyStatus');
+const playersListEl = document.getElementById('playersList');
+const tileInfoEl = document.getElementById('tileInfo');
+
+let uid = null;
+let displayName = '';
+let currentPartyId = null;
+let currentPartyUnsub = null;
+let currentMatchId = null;
+let currentMatchUnsub = null;
+let myPlayerIndex = null; // index inside match.players
+
+// Map config (same for all clients)
+const COLS = 12;
+const ROWS = 8;
+const TILE = Math.floor(Math.min(canvas.width/COLS, canvas.height/ROWS));
+const OFFSET_X = Math.floor((canvas.width - COLS*TILE)/2);
+const OFFSET_Y = Math.floor((canvas.height - ROWS*TILE)/2);
+
+// local view
+let viewMatch = null; // mirror of match doc
+let selected = null;
+
+// ------------------ Utils ------------------
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  logEl.innerHTML = `<div>[${t}] ${msg}</div>` + logEl.innerHTML;
+}
+
+function genCode(len=6){ return Math.random().toString(36).substring(2, 2+len).toUpperCase(); }
+function tileKey(x,y){ return `${x},${y}`; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+// ------------------ AUTH ------------------
+document.getElementById('btnAnon').onclick = async ()=>{
+  displayName = document.getElementById('displayName').value.trim() || null;
+  try{
+    await signInAnonymously(auth);
+  }catch(e){ log('Auth error: '+e.message); }
+};
+
+onAuthStateChanged(auth, user=>{
+  if(user){ uid = user.uid; log('Angemeldet: '+uid.slice(0,6)); }
+  else { uid = null; log('Abgemeldet'); }
+});
+
+// ------------------ PARTY ------------------
+document.getElementById('createParty').onclick = async ()=>{
+  if(!uid){ log('Login zuerst'); return; }
+  const id = genCode(6);
+  const ref = doc(db, 'parties', id);
+  await setDoc(ref, {
+    hostUid: uid,
+    createdAt: serverTimestamp(),
+    isPrivate: true,
+    players: [{ uid, name: displayName || ('Player-'+uid.slice(0,6)) }],
+    status: 'waiting'
+  });
+  joinPartyLocal(id);
+};
+
+document.getElementById('joinParty').onclick = async ()=>{
+  if(!uid){ log('Login zuerst'); return; }
+  const id = document.getElementById('partyInput').value.trim().toUpperCase();
+  if(!id){ log('Gib Party-Code!'); return; }
+  const ref = doc(db, 'parties', id);
+  const snap = await getDoc(ref);
+  if(!snap.exists()){ log('Party nicht gefunden'); return; }
+  await updateDoc(ref, {
+    players: arrayUnion({ uid, name: displayName || ('Player-'+uid.slice(0,6)) })
+  });
+  joinPartyLocal(id);
+};
+
+document.getElementById('leaveParty').onclick = async ()=>{
+  if(!currentPartyId){ log('Nicht in Party'); return; }
+  const ref = doc(db, 'parties', currentPartyId);
+  await updateDoc(ref, {
+    players: arrayRemove({ uid, name: displayName || ('Player-'+uid.slice(0,6)) })
+  });
+  if(currentPartyUnsub) currentPartyUnsub();
+  currentPartyId = null;
+  partyStatusEl.textContent = 'Nicht verbunden';
+  playersListEl.innerHTML = '';
+  log('Party verlassen');
+};
+
+function joinPartyLocal(id){
+  if(currentPartyUnsub) currentPartyUnsub();
+  currentPartyId = id;
+  partyStatusEl.textContent = 'In Party: ' + id;
+  log('Joined ' + id);
+  const ref = doc(db, 'parties', id);
+  currentPartyUnsub = onSnapshot(ref, snap=>{
+    if(!snap.exists()){ partyStatusEl.textContent = 'Party gelöscht'; return; }
+    const data = snap.data();
+    renderParty(data);
+    // Wenn Host gestartet hat, load match
+    if(data.status === 'starting' && data.matchId){
+      loadMatch(data.matchId);
+    }
+  });
+}
+
+function renderParty(data){
+  playersListEl.innerHTML = '';
+  (data.players||[]).forEach((p,i)=>{
+    const d = document.createElement('div');
+    d.textContent = `${i+1}. ${p.name || p.uid.slice(0,6)} ${p.uid === data.hostUid ? '(Host)' : ''}`;
+    playersListEl.appendChild(d);
+  });
+  // show start button enabled only for host
+  const startBtn = document.getElementById('startMatch');
+  startBtn.disabled = (data.hostUid !== uid);
+}
+
+// ------------------ START MATCH (host) ------------------
+document.getElementById('startMatch').onclick = async ()=>{
+  if(!currentPartyId){ log('Kein Party'); return; }
+  const partyRef = doc(db, 'parties', currentPartyId);
+  const partySnap = await getDoc(partyRef);
+  if(!partySnap.exists()) return log('Party weg');
+  const pData = partySnap.data();
+  if(pData.hostUid !== uid) return log('Nur Host kann starten');
+
+  // Erzeuge Match-Dokument mit initialer Map
+  const matchId = genCode(7);
+  // build map: array of tile objects keyed by "x,y"
+  const tiles = {};
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      tiles[tileKey(x,y)] = { owner: null, units: 0, city: false, res: (Math.random()<0.08?3:(Math.random()<0.2?2:1)) };
+    }
+  }
+  // spawn starting cities for players (spread)
+  const starts = [
+    [1,1],
+    [COLS-2,ROWS-2],
+    [1,ROWS-2],
+    [COLS-2,1]
+  ];
+  (pData.players||[]).forEach((pl,i)=>{
+    const pos = starts[i % starts.length];
+    const k = tileKey(pos[0], pos[1]);
+    tiles[k].owner = pl.uid;
+    tiles[k].units = 5;
+    tiles[k].city = true;
+  });
+
+  const matchRef = doc(db, 'matches', matchId);
+  await setDoc(matchRef, {
+    createdAt: serverTimestamp(),
+    players: pData.players, // array of {uid,name}
+    tiles,
+    turnIndex: 0, // index into players array
+    round: 1,
+    status: 'running'
+  });
+
+  // update party to point to match
+  await updateDoc(partyRef, { status: 'starting', matchId });
+  log('Match gestartet: ' + matchId);
+};
+
+// ------------------ LOAD MATCH (everyone) ------------------
+async function loadMatch(matchId){
+  if(currentMatchUnsub) currentMatchUnsub();
+  currentMatchId = matchId;
+  const ref = doc(db, 'matches', matchId);
+  currentMatchUnsub = onSnapshot(ref, snap=>{
+    if(!snap.exists()){ log('Match deleted'); return; }
+    viewMatch = snap.data();
+    renderMatch();
+  });
+  log('Match geladen: '+matchId);
+}
+
+// ------------------ RENDER MAP ------------------
+function renderMatch(){
+  // draw grid from viewMatch.tiles
+  draw();
+  // find my player index
+  if(!viewMatch) return;
+  myPlayerIndex = (viewMatch.players || []).findIndex(p => p.uid === uid);
+  // update UI tileInfo when selected
+  updateTileInfo();
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // BG
+  ctx.fillStyle = '#081221';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      const px = OFFSET_X + x*TILE;
+      const py = OFFSET_Y + y*TILE;
+      // tile background
+      ctx.fillStyle = '#0e1a26';
+      ctx.fillRect(px+1,py+1,TILE-2,TILE-2);
+      // owner tint
+      const t = viewMatch?.tiles?.[tileKey(x,y)];
+      if(t && t.owner){
+        // color by hashing uid -> simple color
+        ctx.fillStyle = uidColor(t.owner);
+        ctx.globalAlpha = 0.18;
+        ctx.fillRect(px+1,py+1,TILE-2,TILE-2);
+        ctx.globalAlpha = 1;
+      }
+      // grid
+      ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+      ctx.strokeRect(px+0.5,py+0.5,TILE-1,TILE-1);
+      // city
+      if(t && t.city){
+        ctx.fillStyle = '#ffd66b';
+        roundRect(ctx, px + TILE*0.22, py + TILE*0.22, TILE*0.56, TILE*0.56, 6, true, false);
+      }
+      // units
+      if(t && t.units>0){
+        ctx.fillStyle = '#e6eef8';
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText(t.units, px + TILE - 22, py + TILE - 10);
+        if(t.owner){
+          // owner dot
+          ctx.fillStyle = uidColor(t.owner);
+          ctx.beginPath(); ctx.arc(px+12,py+TILE-12,6,0,Math.PI*2); ctx.fill();
+        }
+      }
+      // selection highlight
+      if(selected && selected.x===x && selected.y===y){
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(px+3,py+3,TILE-6,TILE-6);
+        ctx.lineWidth = 1;
+      }
+    }
+  }
+}
+
+// helper: map uid -> color
+function uidColor(uidStr){
+  const s = uidStr || 'anon';
+  let h = 0;
+  for(let i=0;i<s.length;i++) h = (h<<5) - h + s.charCodeAt(i);
+  const r = (h>>16)&255, g=(h>>8)&255, b=h&255;
+  return `rgba(${Math.abs(r)%200+30},${Math.abs(g)%200+30},${Math.abs(b)%200+30},1)`;
+}
+
+function roundRect(ctx,x,y,w,h,r,fill,stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+  if(fill) ctx.fill();
+  if(stroke) ctx.stroke();
+}
+
+// canvas click handling
+canvas.addEventListener('click', async (ev)=>{
+  if(!viewMatch) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  const my = ev.clientY - rect.top;
+  const gx = Math.floor((mx - OFFSET_X)/TILE);
+  const gy = Math.floor((my - OFFSET_Y)/TILE);
+  if(gx < 0 || gy < 0 || gx >= COLS || gy >= ROWS) return;
+  const t = viewMatch.tiles[tileKey(gx,gy)];
+  // selection toggle
+  if(!selected){ selected = {x:gx,y:gy}; renderMatch(); return; }
+  if(selected.x===gx && selected.y===gy){ selected = null; renderMatch(); return; }
+  // if selected tile belongs to me and clicked a neighbor -> move
+  const selTile = viewMatch.tiles[tileKey(selected.x, selected.y)];
+  if(selTile && selTile.owner === uid && isNeighbor(selected, {x:gx,y:gy})){
+    // move half units (min 1)
+    const moveCount = Math.max(1, Math.floor(selTile.units / 2));
+    if(moveCount <= 0) { log('Keine Einheiten zum bewegen'); selected = null; renderMatch(); return; }
+    // execute move via transaction to avoid races
+    await performMove(selected.x, selected.y, gx, gy, moveCount);
+    selected = null;
+    return;
+  }
+  // else select new
+  selected = {x:gx,y:gy}; renderMatch();
+});
+
+function isNeighbor(a,b){
+  const dx = Math.abs(a.x-b.x), dy = Math.abs(a.y-b.y);
+  return dx+dy === 1;
+}
+
+// ------------------ ACTIONS (move, build, recruit, endTurn) ------------------
+async function performMove(x1,y1,x2,y2,count){
+  if(!currentMatchId) return log('Kein Match');
+  const matchRef = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const snap = await tx.get(matchRef);
+      if(!snap.exists()) throw 'Match weg';
+      const m = snap.data();
+      // ensure it's your turn
+      const turnIdx = m.turnIndex || 0;
+      if(!m.players || !m.players[turnIdx] || m.players[turnIdx].uid !== uid){
+        throw 'Nicht dein Zug';
+      }
+      const keyFrom = tileKey(x1,y1);
+      const keyTo = tileKey(x2,y2);
+      const from = m.tiles[keyFrom];
+      const to = m.tiles[keyTo];
+      if(!from || from.owner !== uid) throw 'Quelle gehört nicht dir';
+      if(from.units < count) throw 'Nicht genug Einheiten';
+      // subtract
+      from.units -= count;
+      // combat if owner differs
+      if(to.owner && to.owner !== uid){
+        const attack = count + Math.floor(Math.random()*3);
+        const defend = to.units + (to.city?2:0) + Math.floor(Math.random()*3);
+        if(attack > defend){
+          to.owner = uid;
+          to.units = Math.max(0, attack - Math.floor(defend/2));
+        } else {
+          to.units = Math.max(0, defend - Math.floor(attack/2));
+        }
+      } else {
+        // peaceful move
+        to.owner = uid;
+        to.units = (to.units || 0) + count;
+      }
+      // write back
+      m.tiles[keyFrom] = from;
+      m.tiles[keyTo] = to;
+      tx.update(matchRef, { tiles: m.tiles });
+    });
+    log(`Move ${x1},${y1} -> ${x2},${y2} : ${count}`);
+  }catch(e){
+    log('Move failed: ' + e);
+  }
+}
+
+// build city
+document.getElementById('buildCity').onclick = async ()=>{
+  if(!selected) return log('Select ein Feld');
+  if(!currentMatchId) return log('No match');
+  const key = tileKey(selected.x, selected.y);
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match weg';
+      const m = s.data();
+      const tile = m.tiles[key];
+      if(!tile) throw 'Tile fehlt';
+      // only owner can build
+      if(tile.owner !== uid) throw 'Nicht dein Feld';
+      if(tile.city) throw 'Schon Stadt';
+      // cost - for simplicity we don't track money on match; just allow limited builds
+      tile.city = true;
+      m.tiles[key] = tile;
+      tx.update(ref, { tiles: m.tiles });
+    });
+    log('Stadt gebaut');
+  }catch(e){ log('Build failed: '+e); }
+};
+
+// recruit unit (adds 1 unit to selected, owner only)
+document.getElementById('recruitUnit').onclick = async ()=>{
+  if(!selected) return log('Select ein Feld');
+  if(!currentMatchId) return log('No match');
+  const key = tileKey(selected.x, selected.y);
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match gone';
+      const m = s.data();
+      const tile = m.tiles[key];
+      if(!tile) throw 'Tile missing';
+      if(tile.owner !== uid) throw 'Nicht dein Feld';
+      tile.units = (tile.units || 0) + 1;
+      m.tiles[key] = tile;
+      tx.update(ref, { tiles: m.tiles });
+    });
+    log('1 Einheit rekrutiert');
+  }catch(e){ log('Recruit failed: ' + e); }
+};
+
+// end turn
+document.getElementById('endTurn').onclick = async ()=>{
+  if(!currentMatchId) return log('No match');
+  const ref = doc(db, 'matches', currentMatchId);
+  try{
+    await runTransaction(db, async (tx)=>{
+      const s = await tx.get(ref); if(!s.exists()) throw 'Match gone';
+      const m = s.data();
+      const turnIdx = m.turnIndex || 0;
+      if(!m.players || m.players[turnIdx].uid !== uid) throw 'Nicht dein Zug';
+      const next = (turnIdx + 1) % (m.players.length || 1);
+      tx.update(ref, { turnIndex: next, round: (m.round||1) + (next===0?1:0) });
+    });
+    log('Turn ended');
+  }catch(e){ log('End turn failed: ' + e); }
+};
+
+// update tile info UI
+function updateTileInfo(){
+  if(!selected || !viewMatch) { tileInfoEl.textContent = 'Feld: -'; return; }
+  const t = viewMatch.tiles[tileKey(selected.x, selected.y)];
+  const ownerName = (viewMatch.players || []).find(p=>p.uid === t?.owner)?.name || 'Niemand';
+  tileInfoEl.innerHTML = `Feld (${selected.x},${selected.y}) — Besitzer: ${ownerName} — Stadt: ${t?.city?'Ja':'Nein'} — Einheiten: ${t?.units||0} — Ressource: ${t?.res||1}`;
+}
+
+// update UI on every snapshot change
+setInterval(()=>{ renderMatch(); updateTileInfo(); }, 800);
+
+// initial draw loop
+function anim(){
+  if(viewMatch) draw();
+  requestAnimationFrame(anim);
+}
+anim();
+
+</script>
+</body>
+</html>
